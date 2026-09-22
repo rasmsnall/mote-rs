@@ -1,17 +1,26 @@
 mod apply;
+mod archive;
 mod dedupe;
+mod ident;
 mod plan;
+mod route;
+mod rules;
 mod walk;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use plan::Plan;
+use rules::Rules;
 
 #[derive(Parser)]
-#[command(name = "mote", version, about = "Filesystem triage: route files, find duplicates")]
+#[command(
+    name = "mote",
+    version,
+    about = "Filesystem triage: route files, find duplicates"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -19,12 +28,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write a starter rules.toml.
+    Init {
+        /// Where to write it.
+        #[arg(default_value = "rules.toml")]
+        out: PathBuf,
+    },
     /// Walk a tree and write a plan. Touches nothing.
     Scan {
         root: PathBuf,
+        /// Routing rules.
+        #[arg(short, long, default_value = "rules.toml")]
+        rules: PathBuf,
         /// Where to write the plan; defaults to stdout.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Open archives and file their contents individually, instead of
+        /// treating each archive as one item to route.
+        #[arg(long)]
+        extract: bool,
     },
     /// Execute a plan produced by `scan`.
     Apply {
@@ -37,34 +59,70 @@ enum Command {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Scan { root, out } => scan(root, out),
+        Command::Init { out } => init(out),
+        Command::Scan {
+            root,
+            rules,
+            out,
+            extract,
+        } => scan(root, rules, out, extract),
         Command::Apply { plan, commit } => apply(plan, commit),
     }
 }
 
-fn scan(root: PathBuf, out: Option<PathBuf>) -> Result<()> {
+fn init(out: PathBuf) -> Result<()> {
+    if out.exists() {
+        bail!("{} already exists", out.display());
+    }
+    std::fs::write(&out, rules::TEMPLATE).with_context(|| format!("writing {}", out.display()))?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+fn scan(root: PathBuf, rules_path: PathBuf, out: Option<PathBuf>, extract: bool) -> Result<()> {
+    let rules = Rules::load(&rules_path)?;
+
     let entries = walk::scan(&root);
     let duplicates = dedupe::find(&entries);
+    let routed = route::build(&root, &entries, &duplicates, &rules, extract);
 
     let plan = Plan {
         root,
         scanned: entries.len(),
-        // Routing is not wired up yet: the archive semantics are undecided.
-        actions: Vec::new(),
+        actions: routed.actions,
         duplicates,
+        unroutable: routed.unroutable,
     };
 
+    let (moves, quarantines, extracts) = plan.tally();
     eprintln!(
-        "scanned {} files, {} duplicate groups, {} reclaimable",
+        "scanned {} files: {moves} to move, {quarantines} to quarantine, \
+         {extracts} archives to expand",
         plan.scanned,
+    );
+    eprintln!(
+        "{} duplicate groups, {} reclaimable",
         plan.duplicates.len(),
         human(plan.reclaimable()),
     );
+    if extracts > 0 {
+        eprintln!(
+            "{} to be written out of archives",
+            human(plan.extracted_bytes())
+        );
+    }
+    if !plan.unroutable.is_empty() {
+        eprintln!(
+            "{} files matched no rule and will be left alone",
+            plan.unroutable.len()
+        );
+    }
 
     let json = plan.to_json()?;
     match out {
-        Some(path) => std::fs::write(&path, json)
-            .with_context(|| format!("writing {}", path.display()))?,
+        Some(path) => {
+            std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?
+        }
         None => println!("{json}"),
     }
     Ok(())
@@ -72,13 +130,33 @@ fn scan(root: PathBuf, out: Option<PathBuf>) -> Result<()> {
 
 fn apply(path: PathBuf, commit: bool) -> Result<()> {
     let plan = Plan::from_json(
-        &std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?,
+        &std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?,
     )?;
 
     if !commit {
         for action in &plan.actions {
-            println!("{action:?}");
+            match action {
+                plan::Action::Move { from, to } => {
+                    println!("move      {} -> {}", from.display(), to.display());
+                }
+                plan::Action::Quarantine { from, to, reason } => {
+                    println!(
+                        "quarantine {} -> {} ({reason})",
+                        from.display(),
+                        to.display()
+                    );
+                }
+                plan::Action::Extract { from, members, .. } => {
+                    println!("extract   {} ({} members)", from.display(), members.len());
+                    for member in members {
+                        println!(
+                            "             {} -> {}",
+                            member.name.display(),
+                            member.to.display()
+                        );
+                    }
+                }
+            }
         }
         eprintln!("{} actions; re-run with --commit", plan.actions.len());
         return Ok(());

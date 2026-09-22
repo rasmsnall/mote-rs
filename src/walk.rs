@@ -10,13 +10,19 @@ pub struct Entry {
     pub size: u64,
 }
 
-/// Walk `root` in parallel, returning every regular file.
+/// Walk `root` in parallel, returning every regular file in path order.
 ///
 /// Symlinks are not followed: a link farm would otherwise produce phantom
 /// duplicates, and following one out of `root` would let a scan escape the
 /// mounted volume.
+///
+/// The result is sorted. Parallel traversal finishes in whatever order the
+/// threads happen to, and every later stage — which duplicate survives, which
+/// file wins a contested destination — depends on that order. Sorting here is
+/// what makes two scans of an unchanged tree produce the same plan, so a plan
+/// can be diffed and re-reviewed.
 pub fn scan(root: &std::path::Path) -> Vec<Entry> {
-    WalkDir::new(root)
+    let mut entries: Vec<Entry> = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
@@ -28,5 +34,8 @@ pub fn scan(root: &std::path::Path) -> Vec<Entry> {
                 size,
             })
         })
-        .collect()
+        .collect();
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
 }
