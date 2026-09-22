@@ -52,16 +52,33 @@ pub fn find(entries: &[Entry]) -> Vec<Group> {
     let mut groups: Vec<Group> = bucket(full.into_iter(), |(hash, _)| hash.clone())
         .into_iter()
         .filter(|(_, group)| group.len() > 1)
-        .map(|(hash, group)| Group {
-            hash,
-            size: group[0].1.size,
-            paths: group.into_iter().map(|(_, e)| e.path).collect(),
+        .map(|(hash, group)| {
+            let mut paths: Vec<PathBuf> = group.into_iter().map(|(_, e)| e.path).collect();
+            // Sorted so the survivor — the first path — is a property of the
+            // tree rather than of which thread hashed which file first.
+            paths.sort();
+            Group {
+                hash,
+                size: entry_size(&paths[0]),
+                paths,
+            }
         })
         .collect();
 
-    // Largest wasted space first: that is the order a human wants to review in.
-    groups.sort_by_key(|g| std::cmp::Reverse(g.size * (g.paths.len() as u64 - 1)));
+    // Largest wasted space first: that is the order a human wants to review
+    // in. Ties break on the hash so the ordering is total and reproducible.
+    groups.sort_by(|a, b| {
+        let waste = |g: &Group| g.size * (g.paths.len() as u64 - 1);
+        waste(b).cmp(&waste(a)).then_with(|| a.hash.cmp(&b.hash))
+    });
     groups
+}
+
+/// Re-stat a survivor for its size. Every file in a group is byte-identical,
+/// so any of them answers; reading it from the path keeps `Group` honest even
+/// though the bucket already knew it.
+fn entry_size(path: &PathBuf) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 fn bucket<T, K, F>(items: impl Iterator<Item = T>, key: F) -> HashMap<K, Vec<T>>
